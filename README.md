@@ -1,532 +1,603 @@
-# # 🚨 CrowdSafe AI — Real-Time Crowd Monitoring & Stampede Detection
+#  CityPulse: A Weather Analytics Pipeline
 
-An end-to-end **AI-powered crowd safety monitoring system** that uses computer vision to detect people, analyze crowd density and movement, identify high-risk zones, and generate potential stampede-risk alerts.
+An end-to-end **data engineering pipeline** that collects live weather data for five cities, streams it through **Apache Kafka**, lands it in a **PostgreSQL staging database**, transforms it with **PySpark** into an analytics-ready warehouse, and answers analytical questions with **SQL**.
 
-The project combines **YOLOv8, OpenCV, Streamlit, Flask, MLflow, DVC, Docker, and GitHub Actions** to demonstrate a complete **Computer Vision + MLOps pipeline** from model training to deployment.
-
----
-
-## 🎯 Project Overview
-
-CrowdSafe AI analyzes video, webcam, DroidCam, or image input in real time to monitor crowd behavior.
-
-The system:
-
-* Detects people using a fine-tuned **YOLOv8 Nano** model
-* Estimates crowd density using **Gaussian density heatmaps**
-* Analyzes crowd movement using **Farneback Dense Optical Flow**
-* Divides the scene into a **4×3 grid** for localized risk analysis
-* Calculates zone-level crowd risk scores
-* Identifies potentially dangerous crowd conditions
-* Generates alerts for high-risk zones
-* Provides a real-time **Streamlit dashboard**
-* Includes an end-to-end **MLOps pipeline** for experiment tracking, versioning, deployment, and monitoring
+The entire pipeline is orchestrated by **Apache Airflow** and runs locally using **Docker Compose**.
 
 ---
 
-## ✨ Key Features
-
-### 👥 Real-Time Person Detection
-
-* Fine-tuned **YOLOv8 Nano** object detection model
-* Real-time inference on video and webcam streams
-* Supports image-based detection
-* Bounding-box visualization and person counting
-
-### 🌡️ Crowd Density Analysis
-
-* Gaussian density heatmap generation
-* Visual representation of crowd concentration
-* Zone-based density analysis
-* Helps identify areas with unusually high crowd concentration
-
-### 🌊 Crowd Movement Analysis
-
-Uses **Farneback Dense Optical Flow** to analyze movement between video frames.
-
-The system can identify:
-
-* Movement intensity
-* Directional crowd motion
-* Sudden changes in movement
-* Potentially abnormal movement patterns
-
-### 🗺️ 4×3 Zone-Based Risk Scoring
-
-The monitored area is divided into **12 zones** using a 4×3 grid.
-
-Each zone is evaluated using crowd-related indicators such as:
-
-* People density
-* Crowd movement
-* Movement intensity
-* Localized crowd concentration
-
-The resulting risk score helps identify **high-risk areas within the scene**.
-
-### 🚨 Risk Alerts
-
-The system generates alerts when crowd conditions exceed predefined risk thresholds.
-
-Example:
+##  Architecture
 
 ```text
-⚠️ HIGH RISK DETECTED
-Zone: B3
-Risk Score: 82%
-Reason: High crowd density + intense movement
+                         hourly (@hourly)
+      Open-Meteo API ──────────────────────▶ Airflow DAG: ingest_weather
+      (5 fixed cities)                         │
+                                               ├── Task 1:
+                                               │   produce_weather_readings
+                                               │   (1 JSON message/city)
+                                               │
+                                               ▼
+                                      Kafka Topic: weather_raw
+                                               │
+                                               ▼
+                                               ├── Task 2:
+                                               │   load_to_staging
+                                               │   (idempotent insert)
+                                               │
+                                               ▼
+                              PostgreSQL staging.weather_raw
+                                               │
+                                               │
+                                               │ daily (@daily)
+                                               ▼
+                              Airflow DAG: transform_weather
+                                               │
+                                               ▼
+                                  spark/transform_job.py
+                                  (Local-mode PySpark + JDBC)
+                                               │
+                         ┌─────────────────────┼─────────────────────┐
+                         │                     │                     │
+                         ▼                     ▼                     ▼
+                    Parse JSON            Clean Data          Deduplicate
+                         │                     │                     │
+                         └─────────────────────┼─────────────────────┘
+                                               │
+                                               ▼
+                                  Weather Code Mapping
+                                               │
+                                               ▼
+                                    Daily Aggregations
+                                               │
+                                               ▼
+                        ┌─────────────────────────────────────────────┐
+                        │              PostgreSQL Warehouse           │
+                        │                                             │
+                        │  warehouse.dim_city                         │
+                        │  warehouse.fact_weather_hourly              │
+                        │  warehouse.fact_weather_daily               │
+                        └──────────────────────┬──────────────────────┘
+                                               │
+                                               ▼
+                                    sql/analytics.sql
+                                      (5 SQL queries)
 ```
 
-### 📊 Streamlit Dashboard
+### Database Architecture
 
-Interactive dashboard supporting:
+One PostgreSQL container serves two database roles:
 
-* Video upload
-* Webcam input
-* DroidCam input
-* Image input
-* Real-time detection
-* Crowd heatmaps
-* Optical-flow visualization
-* Risk-zone visualization
-* Alert logging
-* CSV export
+* `airflow` — stores Airflow's internal metadata
+* `weatherdb` — stores the project's weather data
+
+The `weatherdb` database contains:
+
+```text
+weatherdb
+│
+├── staging
+│   └── weather_raw
+│
+└── warehouse
+    ├── dim_city
+    ├── fact_weather_hourly
+    └── fact_weather_daily
+```
+
+The database and schemas are initialized automatically by:
+
+```text
+init-sql/01_init.sql
+```
+
+### Historical Data Backfill
+
+A third DAG, **`backfill_weather`**, is included to seed several days of real historical weather data using Open-Meteo's `past_days` parameter.
+
+This allows the warehouse to contain sufficient historical data for meaningful analytics without waiting several days for the scheduled hourly pipeline to accumulate data.
+
+The backfill follows the same:
+
+```text
+Open-Meteo
+    ↓
+Kafka
+    ↓
+PostgreSQL Staging
+    ↓
+PySpark
+    ↓
+Data Warehouse
+```
+
+workflow as the live pipeline.
 
 ---
 
-# 🧠 System Architecture
+##  Components
 
-```text
-                ┌─────────────────────┐
-                │   Video / Webcam    │
-                │   DroidCam / Image  │
-                └──────────┬──────────┘
-                           │
-                           ▼
-                ┌─────────────────────┐
-                │    YOLOv8 Nano      │
-                │  Person Detection   │
-                └──────────┬──────────┘
-                           │
-             ┌─────────────┼─────────────┐
-             │             │             │
-             ▼             ▼             ▼
-      ┌────────────┐ ┌────────────┐ ┌──────────────┐
-      │   Crowd    │ │  Optical   │ │    Person    │
-      │   Density  │ │    Flow    │ │    Count     │
-      │  Heatmap   │ │  Analysis  │ │              │
-      └─────┬──────┘ └──────┬─────┘ └──────┬───────┘
-            │               │              │
-            └───────────────┼──────────────┘
-                            ▼
-                 ┌─────────────────────┐
-                 │   4×3 Risk Grid     │
-                 │   Zone Scoring      │
-                 └──────────┬──────────┘
-                            │
-                            ▼
-                 ┌─────────────────────┐
-                 │  Risk Classification│
-                 │ Low / Medium / High │
-                 └──────────┬──────────┘
-                            │
-                            ▼
-                 ┌─────────────────────┐
-                 │ Alerts & Dashboard  │
-                 │ Streamlit Interface │
-                 └─────────────────────┘
-```
+| Component                   | What it does                                                                                                              |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `docker-compose.yml`        | Spins up PostgreSQL, single-broker Kafka in KRaft mode, and Airflow webserver + scheduler on one Docker network           |
+| `airflow/Dockerfile`        | Extends the Airflow image with Java, PySpark dependencies, `kafka-python`, and the PostgreSQL JDBC driver                 |
+| `init-sql/01_init.sql`      | Initializes `weatherdb`, staging schemas, warehouse schemas, and tables                                                   |
+| `dags/ingest_weather.py`    | Hourly DAG that fetches weather data for all five cities, publishes messages to Kafka, and loads new records into staging |
+| `dags/backfill_weather.py`  | Manual DAG for loading historical weather data through the same Kafka → staging pipeline                                  |
+| `dags/transform_weather.py` | Daily DAG that triggers the PySpark transformation job                                                                    |
+| `dags/common/`              | Shared utilities for API calls, Kafka producers/consumers, and staging database operations                                |
+| `spark/transform_job.py`    | PySpark transformation job that cleans, deduplicates, aggregates, and loads warehouse tables                              |
+| `sql/analytics.sql`         | Contains the five analytical SQL queries required by the project                                                          |
 
 ---
 
-# 🤖 Machine Learning
+## Tech Stack
 
-## Model
-
-**YOLOv8 Nano**
-
-The YOLOv8 Nano model was fine-tuned using a custom crowd dataset sourced from **Roboflow**.
-
-### Training Environment
-
-| Parameter         | Details              |
-| ----------------- | -------------------- |
-| Model             | YOLOv8 Nano          |
-| Dataset           | Custom Crowd Dataset |
-| Dataset Source    | Roboflow             |
-| Training Platform | Google Colab         |
-| GPU               | NVIDIA T4            |
-| Training Epochs   | 50                   |
-| Task              | Person Detection     |
-
-The trained model is then integrated into the real-time inference pipeline.
+| Category         | Technology      |
+| ---------------- | --------------- |
+| Language         | Python          |
+| Data Source      | Open-Meteo API  |
+| Streaming        | Apache Kafka    |
+| Message Format   | JSON            |
+| Orchestration    | Apache Airflow  |
+| Processing       | PySpark         |
+| Database         | PostgreSQL      |
+| Query Language   | SQL             |
+| Containerization | Docker          |
+| Environment      | Docker Compose  |
+| Connectivity     | PostgreSQL JDBC |
+| Version Control  | Git / GitHub    |
 
 ---
 
-# 🔬 Computer Vision Pipeline
+#  How to Run From Scratch
 
-### 1. Person Detection
+## Prerequisites
 
-YOLOv8 identifies people within each frame.
+Make sure you have:
 
-```text
-Input Frame
-     ↓
-YOLOv8 Inference
-     ↓
-Person Bounding Boxes
-     ↓
-Person Count
-```
-
-### 2. Density Estimation
-
-Detected person locations are converted into a Gaussian density representation.
-
-```text
-Person Locations
-       ↓
-Gaussian Kernel
-       ↓
-Density Map
-       ↓
-Heatmap Visualization
-```
-
-### 3. Optical Flow
-
-Farneback Dense Optical Flow estimates pixel-level motion between consecutive frames.
-
-```text
-Frame t
-   +
-Frame t+1
-   ↓
-Dense Optical Flow
-   ↓
-Movement Magnitude
-   ↓
-Movement Analysis
-```
-
-### 4. Risk Scoring
-
-The scene is divided into a **4×3 grid**.
-
-Each zone receives a risk score based on crowd-related measurements.
-
-```text
-┌─────┬─────┬─────┬─────┐
-│ A1  │ A2  │ A3  │ A4  │
-├─────┼─────┼─────┼─────┤
-│ B1  │ B2  │ B3  │ B4  │
-├─────┼─────┼─────┼─────┤
-│ C1  │ C2  │ C3  │ C4  │
-└─────┴─────┴─────┴─────┘
-```
-
-The system can then highlight zones with elevated risk.
-
----
-
-# ⚙️ MLOps Pipeline
-
-CrowdSafe AI also demonstrates production-oriented MLOps practices.
-
-### 📈 MLflow
-
-Used for:
-
-* Experiment tracking
-* Parameter logging
-* Metric tracking
-* Model artifacts
-* Model registry
-* Model version management
-* Staging and production model versions
-
-### 📦 DVC
-
-Used for:
-
-* Dataset version control
-* Model versioning
-* Reproducible experiments
-* Tracking large ML artifacts
-
-### 🔄 GitHub Actions
-
-Used to automate CI/CD workflows.
-
-Example pipeline:
-
-```text
-Git Push
-   ↓
-GitHub Actions
-   ↓
-Install Dependencies
-   ↓
-Run Tests
-   ↓
-Validate Project
-   ↓
-Build Docker Image
-   ↓
-Deployment
-```
-
-### 🐳 Docker
-
-The application is containerized for consistent deployment across environments.
-
-### 🌐 Flask REST API
-
-A Flask API provides model-serving endpoints.
-
-Available endpoints:
-
-```text
-GET  /health
-POST /predict
-```
-
-Example:
-
-```bash
-curl http://localhost:5000/health
-```
-
-### 📉 Drift Detection
-
-The system includes monitoring to identify potential degradation in model performance over time.
-
----
-
-# 🛠️ Tech Stack
-
-### Programming
-
-* Python
-
-### Machine Learning / Computer Vision
-
-* YOLOv8
-* OpenCV
-* NumPy
-
-### Application
-
-* Streamlit
-* Flask
-
-### MLOps
-
-* MLflow
-* DVC
-* Docker
-* GitHub Actions
-
-### Development
-
+* Docker Desktop or Docker Engine
+* Docker Compose
 * Git
-* GitHub
-* Google Colab
+
+Docker must be installed and running before starting the project.
 
 ---
-
-# 📁 Project Structure
-
-```text
-crowdsafe-ai/
-│
-├── app.py                         # Streamlit dashboard
-│
-├── src/
-│   ├── detection.py               # YOLOv8 inference
-│   ├── heatmap.py                 # Gaussian density heatmaps
-│   ├── optical_flow.py            # Farneback optical flow
-│   └── risk_scoring.py            # Zone-based risk scoring
-│
-├── api/
-│   └── app.py                     # Flask REST API
-│
-├── mlflow/
-│   └── ...                         # MLflow configurations
-│
-├── .github/
-│   └── workflows/
-│       └── ...                     # GitHub Actions CI/CD
-│
-├── Dockerfile                     # Docker configuration
-├── requirements.txt               # Python dependencies
-├── README.md
-└── ...
-```
-
----
-
-# 🚀 Installation & Setup
 
 ## 1. Clone the Repository
 
 ```bash
-git clone https://github.com/DhulakshanKannan/crowdsafe-ai.git
-cd crowdsafe-ai
+git clone https://github.com/DhulakshanKannan/citypulse-data-engineering.git
+cd citypulse-data-engineering
 ```
 
-## 2. Create a Virtual Environment
+---
+
+## 2. Build and Start the Pipeline
+
+Run:
 
 ```bash
-python -m venv venv
+docker compose up -d --build
 ```
 
-### Windows
+The first run may take several minutes because Docker needs to:
+
+* Download required images
+* Build the custom Airflow image
+* Install Java dependencies
+* Install PySpark
+* Configure the Kafka broker
+* Initialize PostgreSQL
+
+To monitor the startup process:
 
 ```bash
-venv\Scripts\activate
+docker compose logs -f
 ```
 
-### Linux / macOS
+---
+
+## 3. Check Container Health
+
+Run:
 
 ```bash
-source venv/bin/activate
+docker compose ps
 ```
 
-## 3. Install Dependencies
+You should see the following services running:
+
+```text
+citypulse-postgres
+citypulse-kafka
+citypulse-airflow-webserver
+citypulse-airflow-scheduler
+```
+
+The one-time initialization container:
+
+```text
+citypulse-airflow-init
+```
+
+should show:
+
+```text
+Exited (0)
+```
+
+This is expected.
+
+---
+
+## 4. Open the Airflow UI
+
+Open:
+
+```text
+http://localhost:8080
+```
+
+Default credentials:
+
+```text
+Username: admin
+Password: admin
+```
+
+---
+
+#  5. Backfill Historical Weather Data
+
+Run the backfill once before starting the regular scheduled pipeline.
+
+In the Airflow UI:
+
+```text
+DAGs
+ ↓
+backfill_weather
+ ↓
+Trigger DAG
+ ↓
+Trigger DAG w/ config
+```
+
+Use:
+
+```json
+{
+  "days_back": 10
+}
+```
+
+The DAG will fetch historical weather data and send it through:
+
+```text
+Open-Meteo
+     ↓
+Kafka
+     ↓
+staging.weather_raw
+```
+
+Wait until both tasks complete successfully.
+
+---
+
+#  6. Enable the Scheduled DAGs
+
+In the Airflow DAG list, enable:
+
+```text
+ingest_weather
+transform_weather
+```
+
+### `ingest_weather`
+
+Runs hourly and:
+
+1. Fetches weather data for five cities
+2. Produces JSON messages
+3. Publishes them to Kafka
+4. Consumes the messages
+5. Loads them into PostgreSQL staging
+
+### `transform_weather`
+
+Runs daily and:
+
+1. Reads staging data
+2. Cleans and validates the data
+3. Removes duplicates
+4. Maps weather codes to categories
+5. Calculates daily statistics
+6. Updates the warehouse tables
+
+You can also manually trigger the ingestion DAG for an immediate reading.
+
+---
+
+#  7. Run the Transformation
+
+Once weather data exists in the staging table, trigger:
+
+```text
+transform_weather
+```
+
+from the Airflow UI.
+
+The PySpark job will process the staging data and populate:
+
+```text
+warehouse.dim_city
+warehouse.fact_weather_hourly
+warehouse.fact_weather_daily
+```
+
+The task logs display row counts as the warehouse tables are written.
+
+---
+
+#  8. Check PostgreSQL Results
+
+Connect to the weather database:
 
 ```bash
-pip install -r requirements.txt
+docker exec -it citypulse-postgres psql -U airflow -d weatherdb
 ```
 
-## 4. Run the Streamlit Application
+Then run:
+
+```sql
+SELECT count(*)
+FROM staging.weather_raw;
+```
+
+Check the city dimension:
+
+```sql
+SELECT *
+FROM warehouse.dim_city;
+```
+
+Check the daily weather facts:
+
+```sql
+SELECT *
+FROM warehouse.fact_weather_daily
+ORDER BY reading_date, city_id;
+```
+
+---
+
+#  9. Run the Analytics Queries
+
+The project includes five analytical SQL queries in:
+
+```text
+sql/analytics.sql
+```
+
+Run them directly with:
 
 ```bash
-streamlit run app.py
+docker exec -it citypulse-postgres \
+psql -U airflow -d weatherdb -f /dev/stdin < sql/analytics.sql
 ```
 
-The dashboard will be available locally through the Streamlit server.
+Alternatively, open:
+
+```text
+sql/analytics.sql
+```
+
+and execute the queries individually using:
+
+* `psql`
+* DBeaver
+* pgAdmin
+* Another PostgreSQL client
 
 ---
 
-# 🐳 Run with Docker
+#  10. Monitor Kafka Messages
 
-## Build the Docker Image
+To demonstrate the streaming pipeline, consume messages directly from the Kafka topic:
 
 ```bash
-docker build -t crowdsafe-ai .
+docker exec -it citypulse-kafka \
+/opt/kafka/bin/kafka-console-consumer.sh \
+--bootstrap-server localhost:9092 \
+--topic weather_raw \
+--from-beginning \
+--max-messages 5
 ```
 
-## Run the Container
+You should see JSON weather messages flowing through:
+
+```text
+Open-Meteo API
+      ↓
+Kafka: weather_raw
+```
+
+---
+
+#  Shutting Down
+
+Stop the services while preserving database volumes:
 
 ```bash
-docker run -p 8501:8501 crowdsafe-ai
+docker compose down
 ```
 
-Then open the Streamlit application in your browser.
+Stop the services and remove the database volumes:
 
----
-
-# 📡 API Usage
-
-Start the Flask API and use the available endpoints.
-
-### Health Check
-
-```http
-GET /health
+```bash
+docker compose down -v
 ```
 
-### Prediction
+>  `docker compose down -v` permanently removes the PostgreSQL volumes and therefore deletes the stored project data.
 
-```http
-POST /predict
+---
+
+#  Design Notes
+
+## 1. Overwrite vs Upsert
+
+The PySpark transformation job performs a **full overwrite of the warehouse fact tables** on each run.
+
+This design choice is documented in:
+
+```text
+spark/transform_job.py
 ```
 
-The prediction endpoint accepts an input image and returns the model's detection results.
+The approach keeps the transformation process straightforward and ensures the warehouse is rebuilt from the current staging dataset.
 
 ---
 
-# 📊 Project Outputs
+## 2. Idempotency
 
-CrowdSafe AI produces:
+The staging pipeline is designed to prevent duplicate Kafka records.
 
-* Real-time person detections
-* Person counts
-* Crowd density heatmaps
-* Optical-flow visualizations
-* Zone-level risk scores
-* High-risk zone alerts
-* Alert logs
-* CSV reports
-* MLflow experiment records
-* Versioned ML artifacts
+The table:
 
----
+```text
+staging.weather_raw
+```
 
-# 🎯 Project Objectives
+uses a unique constraint based on:
 
-The main objectives of CrowdSafe AI are to demonstrate how **computer vision and machine learning can be combined with MLOps practices to build a production-oriented safety monitoring system**.
+```text
+(kafka_partition, kafka_offset)
+```
 
-The project focuses on:
+The Kafka consumer commits an offset only after the corresponding database insert succeeds.
 
-* Real-time computer vision
-* Crowd behavior analysis
-* Risk-zone identification
-* Machine learning deployment
-* Experiment tracking
-* Dataset/model versioning
-* CI/CD automation
-* Containerization
-* API-based model serving
-* Model monitoring
+Therefore, if the load task is re-run:
+
+```text
+Kafka Message
+     ↓
+Database Insert
+     ↓
+Success
+     ↓
+Commit Kafka Offset
+```
+
+If the database insert fails, the Kafka offset is not committed, allowing the message to be processed again safely.
 
 ---
 
-# 🔮 Future Improvements
+## 3. Data Flow
 
-Potential future improvements include:
+The complete pipeline can be summarized as:
 
-* [ ] Multi-object tracking with ByteTrack/DeepSORT
-* [ ] Advanced crowd behavior classification
-* [ ] Transformer-based vision models
-* [ ] Improved stampede-event detection
-* [ ] Real-time notification system
-* [ ] Cloud deployment
-* [ ] Kubernetes-based deployment
-* [ ] Advanced model monitoring
-* [ ] Automated model retraining
-* [ ] Edge-device deployment
-* [ ] Multi-camera crowd monitoring
-* [ ] Live monitoring dashboard with historical analytics
-
----
-
-# ⚠️ Disclaimer
-
-CrowdSafe AI is an **academic and experimental project** designed to demonstrate computer vision, machine learning, and MLOps concepts.
-
-Risk scores and alerts are algorithmic indicators and should **not be treated as a replacement for professional security systems, emergency response procedures, or human supervision**.
-
----
-
-# 👨‍💻 Author
-
-**Dhulakshan Kannan**
-
-BSc (Hons) Data Science — Coventry University
-NIBM | HND Machine Learning
-
-**Project:** CrowdSafe AI — Real-Time Crowd Monitoring & Stampede Detection
-
-### 🔗 Links
-
-* **GitHub:** https://github.com/DhulakshanKannan
-* **Project Repository:** https://github.com/DhulakshanKannan/crowdsafe-ai
-* **LinkedIn:** Add your LinkedIn profile URL here
+```text
+        Open-Meteo API
+               │
+               ▼
+       Apache Airflow
+               │
+               ▼
+       Apache Kafka
+       weather_raw
+               │
+               ▼
+        PostgreSQL
+          Staging
+               │
+               ▼
+           PySpark
+               │
+       ┌───────┴────────┐
+       │                │
+       ▼                ▼
+   Cleaning         Aggregation
+       │                │
+       └───────┬────────┘
+               ▼
+      PostgreSQL Warehouse
+               │
+       ┌───────┼────────┐
+       ▼       ▼        ▼
+    dim_city  hourly   daily
+               │
+               ▼
+             SQL
+          Analytics
+```
 
 ---
 
-## ⭐ If you find this project useful
+#  Project Structure
 
-Consider giving the repository a **star ⭐** and following the project for future updates.
+```text
+citypulse-data-engineering/
+│
+├── airflow/
+│   └── Dockerfile
+│
+├── dags/
+│   ├── ingest_weather.py
+│   ├── backfill_weather.py
+│   ├── transform_weather.py
+│   │
+│   └── common/
+│       ├── weather_api.py
+│       ├── kafka_utils.py
+│       └── staging_loader.py
+│
+├── spark/
+│   └── transform_job.py
+│
+├── sql/
+│   └── analytics.sql
+│
+├── init-sql/
+│   └── 01_init.sql
+│
+├── docker-compose.yml
+└── README.md
+```
+
+---
+
+# 🎯 Key Data Engineering Concepts Demonstrated
+
+This project demonstrates practical experience with:
+
+* **ETL / ELT pipelines**
+* **Batch and streaming data processing**
+* **Apache Kafka**
+* **Apache Airflow**
+* **PySpark**
+* **PostgreSQL**
+* **Data warehouse design**
+* **Dimensional modeling**
+* **Data cleaning and transformation**
+* **Data aggregation**
+* **Idempotent data ingestion**
+* **Kafka offset management**
+* **Docker containerization**
+* **SQL analytics**
+* **Pipeline orchestration**
+
+---
+
+#  Author
+
+**Diviyan Periyasmay**
+
+BSc (Hons) Data Science, Coventry University | NIBM
+
+Developed as part of an **HND Data Engineering / Data Science project**.
+
+---
+
+⭐ If you find this project useful, consider giving the repository a star!
