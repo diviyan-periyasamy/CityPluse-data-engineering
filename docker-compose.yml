@@ -1,0 +1,131 @@
+x-airflow-common-env: &airflow-common-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__FERNET_KEY: ""
+  AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: weatherdb
+  POSTGRES_USER: airflow
+  POSTGRES_PASSWORD: airflow
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: citypulse-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-sql:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - citypulse-net
+
+  # Single-broker Kafka using KRaft mode (no Zookeeper needed - simpler for
+  # a project where Kafka is deliberately a small piece of the pipeline).
+  # Uses the official Apache Kafka image (Bitnami removed most version tags
+  # from Docker Hub's free tier, so bitnami/kafka:3.7 is no longer pullable).
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: citypulse-kafka
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+    networks:
+      - citypulse-net
+
+  # One-off container: creates Airflow's metadata tables and an admin user,
+  # then exits. The webserver/scheduler wait for it to finish successfully.
+  airflow-init:
+    build: ./airflow
+    container_name: citypulse-airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./spark:/opt/airflow/spark
+      - airflow_logs:/opt/airflow/logs
+    entrypoint: /bin/bash
+    command: >
+      -c "airflow db migrate &&
+          airflow users create --username admin --password admin
+          --firstname Dulakshan --lastname Student --role Admin
+          --email admin@example.com || true"
+    networks:
+      - citypulse-net
+
+  airflow-webserver:
+    build: ./airflow
+    container_name: citypulse-airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+    environment: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./spark:/opt/airflow/spark
+      - airflow_logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - citypulse-net
+
+  airflow-scheduler:
+    build: ./airflow
+    container_name: citypulse-airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+    environment: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./spark:/opt/airflow/spark
+      - airflow_logs:/opt/airflow/logs
+    command: scheduler
+    networks:
+      - citypulse-net
+
+volumes:
+  postgres_data:
+  airflow_logs:
+
+networks:
+  citypulse-net:
+    driver: bridge
